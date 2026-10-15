@@ -12,6 +12,7 @@
         .\DupWatch.ps1 status                  켜짐/꺼짐 상태와 설정 보기
         .\DupWatch.ps1 mode move|delete        중복 파일을 중복 폴더로 이동 / 삭제
         .\DupWatch.ps1 keep oldest|newest      가장 오래된 파일 유지 / 가장 최근 파일 유지
+        .\DupWatch.ps1 check on|off            내용 비교 켜기 / 끄기
         .\DupWatch.ps1 dupdir "D:\중복"         중복 파일을 옮길 폴더
         .\DupWatch.ps1 watch "D:\다운로드"      감시할 폴더 (기본값: 다운로드 폴더)
         .\DupWatch.ps1 autostart on|off        Windows 로그인 시 자동 시작
@@ -21,13 +22,19 @@
         oldest  기존 파일("사진.png")을 그대로 두고, 새로 받은 "사진 (1).png" 를 처리합니다. (기본값)
         newest  기존 "사진.png" 를 처리하고, 새로 받은 파일의 이름을 "사진.png" 로 바꿔 남깁니다.
 
+    내용 비교 (check):
+        on   이름이 같아도 내용(파일 해시)이 다르면 새 파일을 그대로 남깁니다.
+             내용까지 똑같은 파일만 이동/삭제합니다. (기본값)
+        off  이름만 같으면 내용과 상관없이 무조건 이동/삭제합니다.
+             삭제 모드에서는 내용이 다른 파일도 영구 삭제되므로 주의하세요.
+
     Windows PowerShell 5.1 과 PowerShell 7 에서 모두 동작합니다.
     이 파일은 BOM 이 있는 UTF-8 로 저장되어 있어야 한글이 깨지지 않습니다.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('menu', 'start', 'stop', 'status', 'mode', 'keep', 'dupdir', 'watch', 'autostart', 'log', 'run')]
+    [ValidateSet('menu', 'start', 'stop', 'status', 'mode', 'keep', 'check', 'dupdir', 'watch', 'autostart', 'log', 'run')]
     [string]$Command = 'menu',
 
     [Parameter(Position = 1)]
@@ -75,16 +82,18 @@ function Read-Config {
         DuplicateFolder = Join-Path $dl 'Duplicates'
         Mode            = 'Move'      # Move = 이동, Delete = 삭제
         Keep            = 'Oldest'    # Oldest = 오래된 파일 유지, Newest = 최근 파일 유지
+        ContentCheck    = 'On'        # On = 내용이 다르면 새 파일 유지, Off = 이름만 같으면 무조건 처리
     }
     if (Test-Path -LiteralPath $script:ConfigPath) {
         try {
             $saved = Get-Content -LiteralPath $script:ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            foreach ($k in 'WatchFolder', 'DuplicateFolder', 'Mode', 'Keep') { if ($saved.$k) { $cfg.$k = $saved.$k } }
+            foreach ($k in 'WatchFolder', 'DuplicateFolder', 'Mode', 'Keep', 'ContentCheck') { if ($saved.$k) { $cfg.$k = $saved.$k } }
         } catch {}
     }
     # 잘못된 값이 들어 있으면 기본값으로 되돌림
     if ($cfg.Mode -eq 'Delete') { $cfg.Mode = 'Delete' } else { $cfg.Mode = 'Move' }
     if ($cfg.Keep -eq 'Newest') { $cfg.Keep = 'Newest' } else { $cfg.Keep = 'Oldest' }
+    if ($cfg.ContentCheck -eq 'Off') { $cfg.ContentCheck = 'Off' } else { $cfg.ContentCheck = 'On' }
     $cfg
 }
 
@@ -134,22 +143,18 @@ function Test-SameContent([System.IO.FileInfo]$A, [System.IO.FileInfo]$B) {
         ((Get-FileHash -LiteralPath $A.FullName).Hash -eq (Get-FileHash -LiteralPath $B.FullName).Hash)
 }
 
-# $Target 파일을 없앰: 삭제 모드이고 $Kept 와 내용이 똑같으면 삭제, 그 밖에는 중복 폴더로 이동.
-# 성공하면 $true.
-function Remove-DuplicateFile([System.IO.FileInfo]$Target, [System.IO.FileInfo]$Kept, $Cfg) {
+# $Target 파일을 없앰: 삭제 모드면 삭제, 이동 모드면 중복 폴더로 이동. 성공하면 $true.
+# (내용 비교는 이 함수를 부르기 전에 Invoke-DuplicateAction 에서 끝냄)
+function Remove-DuplicateFile([System.IO.FileInfo]$Target, $Cfg) {
     if ($Cfg.Mode -eq 'Delete') {
-        if (Test-SameContent $Target $Kept) {
-            try {
-                [System.IO.File]::Delete($Target.FullName)
-                Write-DupLog "중복 파일 삭제: $($Target.Name)"
-                return $true
-            } catch {
-                Write-DupLog "삭제 실패 $($Target.Name): $($_.Exception.Message)"
-                return $false
-            }
+        try {
+            [System.IO.File]::Delete($Target.FullName)
+            Write-DupLog "중복 파일 삭제: $($Target.Name)"
+            return $true
+        } catch {
+            Write-DupLog "삭제 실패 $($Target.Name): $($_.Exception.Message)"
+            return $false
         }
-        # 이름만 같고 내용이 다르면 절대 지우지 않고 이동시킴
-        Write-DupLog "내용이 $($Kept.Name) 와(과) 달라 삭제 대신 이동: $($Target.Name)"
     }
 
     try {
@@ -175,9 +180,15 @@ function Invoke-DuplicateAction([System.IO.FileInfo]$File, $Cfg) {
     if (-not $orig -or -not (Test-Path -LiteralPath $orig -PathType Leaf)) { return $false }   # 중복 아님
     $origFile = Get-Item -LiteralPath $orig
 
+    # 내용 비교가 켜져 있으면: 이름만 같고 내용(해시)이 다른 파일은 진짜 중복이 아니므로 그대로 남김
+    if ($Cfg.ContentCheck -eq 'On' -and -not (Test-SameContent $File $origFile)) {
+        Write-DupLog "이름은 같지만 내용이 달라 새 파일 유지: $($File.Name)"
+        return $false
+    }
+
     if ($Cfg.Keep -eq 'Newest') {
         # 최근 파일 유지: 기존 파일을 처리하고, 새 파일에 원래 이름을 붙임
-        if (-not (Remove-DuplicateFile $origFile $File $Cfg)) { return $false }
+        if (-not (Remove-DuplicateFile $origFile $Cfg)) { return $false }
         try {
             [System.IO.File]::Move($File.FullName, $orig)
             Write-DupLog "최근 파일 유지: $($File.Name) -> $($origFile.Name) 로 이름 변경"
@@ -188,7 +199,7 @@ function Invoke-DuplicateAction([System.IO.FileInfo]$File, $Cfg) {
     }
 
     # 오래된 파일 유지 (기본값): 기존 파일은 그대로 두고 새 파일을 처리
-    Remove-DuplicateFile $File $origFile $Cfg
+    Remove-DuplicateFile $File $Cfg
 }
 
 # 감시 폴더를 한 번 검사. $State 에는 검사 사이에 기억해야 하는 내용이 들어 있음
@@ -256,7 +267,7 @@ function Invoke-WatcherLoop {
     try {
         $state = New-WatchState
         $c = Read-Config
-        Write-DupLog "시작됨, 감시 폴더: $($state.Watching) (처리 방식: $(Get-ModeText $c.Mode), 보관 기준: $(Get-KeepText $c.Keep))"
+        Write-DupLog "시작됨, 감시 폴더: $($state.Watching) (처리 방식: $(Get-ModeText $c.Mode), 보관 기준: $(Get-KeepText $c.Keep), 내용 비교: $(Get-CheckText $c.ContentCheck))"
         while (-not $stop.WaitOne($script:PollMs)) {
             try { Invoke-WatchPass $state } catch { Write-DupLog "예상치 못한 오류: $($_.Exception.Message)" }
         }
@@ -274,6 +285,7 @@ function Invoke-WatcherLoop {
 
 function Get-ModeText([string]$Mode) { if ($Mode -eq 'Delete') { '삭제' } else { '이동' } }
 function Get-KeepText([string]$Keep) { if ($Keep -eq 'Newest') { '최근 파일 유지' } else { '오래된 파일 유지' } }
+function Get-CheckText([string]$Check) { if ($Check -eq 'Off') { '꺼짐' } else { '켜짐' } }
 
 function Test-Running {
     $m = $null
@@ -334,6 +346,10 @@ function Set-Setting([string]$Name, [string]$NewValue) {
             if ($NewValue -notin 'oldest', 'newest') { throw "보관 기준은 'oldest'(오래된 파일) 또는 'newest'(최근 파일)만 가능합니다." }
             if ($NewValue -eq 'newest') { $cfg.Keep = 'Newest' } else { $cfg.Keep = 'Oldest' }
         }
+        'check' {
+            if ($NewValue -notin 'on', 'off') { throw "내용 비교는 'on'(켜기) 또는 'off'(끄기)만 가능합니다." }
+            if ($NewValue -eq 'off') { $cfg.ContentCheck = 'Off' } else { $cfg.ContentCheck = 'On' }
+        }
         'watch' {
             $p = Resolve-UserPath $NewValue
             if (-not (Test-Path -LiteralPath $p -PathType Container)) { throw "폴더가 존재하지 않습니다: $p" }
@@ -369,6 +385,7 @@ function Get-Status {
         State           = $(if (Test-Running) { 'ON' } else { 'OFF' })
         Mode            = $cfg.Mode
         Keep            = $cfg.Keep
+        ContentCheck    = $cfg.ContentCheck
         WatchFolder     = $cfg.WatchFolder
         DuplicateFolder = $cfg.DuplicateFolder
         Autostart       = $(if (Test-Autostart) { 'on' } else { 'off' })
@@ -485,6 +502,7 @@ function Get-MenuItems($St) {
         $(if ($St.State -eq 'ON') { '끄기' } else { '켜기' }),
         $(if ($St.Mode -eq 'Delete') { '이동 모드로 전환' } else { '삭제 모드로 전환' }),
         $(if ($St.Keep -eq 'Newest') { '오래된 파일 유지로 전환' } else { '최근 파일 유지로 전환' }),
+        $(if ($St.ContentCheck -eq 'Off') { '내용 비교 켜기' } else { '내용 비교 끄기' }),
         '감시 폴더 변경',
         '중복 폴더 변경',
         $(if ($St.Autostart -eq 'on') { '자동 시작 끄기' } else { '자동 시작 켜기' }),
@@ -502,10 +520,13 @@ function Show-Screen([int]$Sel, [string]$Msg, $St, [int]$W) {
     Write-Rule $G.TL $G.TR $W 'DupWatch'
     if ($St.State -eq 'ON') { $stText = "$($G.Dot) 켜짐"; $stColor = 'Green' } else { $stText = "$($G.Dot) 꺼짐"; $stColor = 'Red' }
     Write-Row $W @(@((Format-Fit '상태' $label), 'DarkGray'), @($stText, $stColor))
-    if ($St.Mode -eq 'Delete') { $modeText = '삭제 (내용이 똑같은 중복 파일만 삭제)' } else { $modeText = '이동 (중복 파일을 중복 폴더로 이동)' }
+    if ($St.Mode -eq 'Delete') { $modeText = '삭제 (중복 파일을 영구 삭제)' } else { $modeText = '이동 (중복 파일을 중복 폴더로 이동)' }
     Write-Row $W @(@((Format-Fit '처리 방식' $label), 'DarkGray'), @($modeText, 'White'))
     if ($St.Keep -eq 'Newest') { $keepText = '최근 파일 유지 (새로 받은 파일을 남김)' } else { $keepText = '오래된 파일 유지 (기존 파일을 남김)' }
     Write-Row $W @(@((Format-Fit '보관 기준' $label), 'DarkGray'), @($keepText, 'White'))
+    if ($St.ContentCheck -eq 'Off') { $checkText = '꺼짐 (이름만 같으면 무조건 처리)'; $checkColor = 'Yellow' }
+    else { $checkText = '켜짐 (내용이 다르면 새 파일 유지)'; $checkColor = 'White' }
+    Write-Row $W @(@((Format-Fit '내용 비교' $label), 'DarkGray'), @($checkText, $checkColor))
     Write-Row $W @(@((Format-Fit '감시 폴더' $label), 'DarkGray'), @((Format-Fit $St.WatchFolder ($inner - $label) -KeepEnd), 'White'))
     Write-Row $W @(@((Format-Fit '중복 폴더' $label), 'DarkGray'), @((Format-Fit $St.DuplicateFolder ($inner - $label) -KeepEnd), 'White'))
     if ($St.Autostart -eq 'on') { $autoText = '켜짐' } else { $autoText = '꺼짐' }
@@ -514,7 +535,7 @@ function Show-Screen([int]$Sel, [string]$Msg, $St, [int]$W) {
 
     $items = Get-MenuItems $St
     for ($i = 0; $i -lt $items.Count; $i++) {
-        $text = Format-Fit (" {0}  {1}" -f ($i + 1), $items[$i]) $inner
+        $text = Format-Fit (" {0}  {1}" -f (($i + 1) % 10), $items[$i]) $inner   # 10번째 항목은 0 키
         if ($i -eq $Sel) { Write-Row $W @(, @($text, 'Black', 'Cyan')) }
         else { Write-Row $W @(, @($text, 'Gray')) }
     }
@@ -536,7 +557,7 @@ function Show-Screen([int]$Sel, [string]$Msg, $St, [int]$W) {
     }
     Write-Rule $G.BL $G.BR $W
 
-    Write-Seg (Format-Fit ' 방향키 이동   Enter 선택   1-9 바로가기   Q 종료' $W) 'DarkGray'
+    Write-Seg (Format-Fit ' 방향키 이동   Enter 선택   1-9,0 바로가기   Q 종료' $W) 'DarkGray'
     Write-Host ''
     Write-Seg (Format-Fit " $Msg" $W) 'Yellow'
     Write-Host ''
@@ -601,23 +622,33 @@ function Invoke-MenuAction([int]$Index, $St) {
         0 { if ($St.State -eq 'ON') { Stop-Watcher } else { Start-Watcher } }
         1 {
             if ($St.Mode -eq 'Delete') { [void](Set-Setting 'mode' 'move'); '처리 방식: 중복 파일을 중복 폴더로 이동합니다.' }
-            else { [void](Set-Setting 'mode' 'delete'); '처리 방식: 똑같은 중복 파일은 삭제합니다. (내용이 다르면 이동)' }
+            elseif ($St.ContentCheck -eq 'Off') { [void](Set-Setting 'mode' 'delete'); '처리 방식: 삭제. 주의! 내용 비교가 꺼져 있어 내용이 달라도 삭제됩니다.' }
+            else { [void](Set-Setting 'mode' 'delete'); '처리 방식: 내용이 똑같은 중복 파일을 삭제합니다.' }
         }
         2 {
             if ($St.Keep -eq 'Newest') { [void](Set-Setting 'keep' 'oldest'); '보관 기준: 기존(오래된) 파일을 남깁니다.' }
             else { [void](Set-Setting 'keep' 'newest'); '보관 기준: 새로 받은(최근) 파일을 원래 이름으로 남깁니다.' }
         }
         3 {
+            if ($St.ContentCheck -eq 'Off') {
+                [void](Set-Setting 'check' 'on'); '내용 비교 켜짐: 이름이 같아도 내용이 다르면 새 파일을 남깁니다.'
+            } else {
+                [void](Set-Setting 'check' 'off')
+                if ($St.Mode -eq 'Delete') { '내용 비교 꺼짐: 주의! 이름만 같으면 내용이 달라도 삭제됩니다.' }
+                else { '내용 비교 꺼짐: 이름만 같으면 내용과 상관없이 이동합니다.' }
+            }
+        }
+        4 {
             $a = Read-FolderInput '감시 폴더' $St.WatchFolder
             if ("$a".Trim()) { $c = Set-Setting 'watch' $a; "감시 폴더: $($c.WatchFolder)" } else { '취소했습니다.' }
         }
-        4 {
+        5 {
             $a = Read-FolderInput '중복 폴더' $St.DuplicateFolder
             if ("$a".Trim()) { $c = Set-Setting 'dupdir' $a; "중복 폴더: $($c.DuplicateFolder)" } else { '취소했습니다.' }
         }
-        5 { Set-Autostart ($St.Autostart -ne 'on') }
-        6 { Show-FullLog; '' }
-        7 {
+        6 { Set-Autostart ($St.Autostart -ne 'on') }
+        7 { Show-FullLog; '' }
+        8 {
             [void][System.IO.Directory]::CreateDirectory($St.DuplicateFolder)
             Invoke-Item -LiteralPath $St.DuplicateFolder
             '중복 폴더를 열었습니다.'
@@ -628,7 +659,7 @@ function Invoke-MenuAction([int]$Index, $St) {
 function Show-Menu {
     $sel = 0
     $msg = '환영합니다! 방향키와 Enter 로 조작하세요.'
-    $count = 9
+    $count = 10
     $lastDraw = [datetime]::MinValue
     $lastWidth = -1
     $dirty = $true
@@ -666,9 +697,12 @@ function Show-Menu {
                 'Q'         { $run = $count - 1 }
                 default {
                     $n = 0
-                    if ([int]::TryParse([string]$key.KeyChar, [ref]$n) -and $n -ge 1 -and $n -le $count) {
-                        $sel = $n - 1
-                        $run = $sel
+                    if ([int]::TryParse([string]$key.KeyChar, [ref]$n)) {
+                        if ($n -eq 0) { $n = 10 }   # 0 키 = 10번 항목 (종료)
+                        if ($n -ge 1 -and $n -le $count) {
+                            $sel = $n - 1
+                            $run = $sel
+                        }
                     }
                 }
             }
@@ -709,6 +743,7 @@ try {
             "상태:       $stText"
             "처리 방식:  $(Get-ModeText $s.Mode)"
             "보관 기준:  $(Get-KeepText $s.Keep)"
+            "내용 비교:  $(Get-CheckText $s.ContentCheck)"
             "감시 폴더:  $($s.WatchFolder)"
             "중복 폴더:  $($s.DuplicateFolder)"
             "자동 시작:  $autoText"
@@ -719,12 +754,13 @@ try {
             if ($Value -notin 'on', 'off') { throw '사용법: autostart on|off' }
             Set-Autostart ($Value -eq 'on')
         }
-        { $_ -in 'mode', 'keep', 'watch', 'dupdir' } {
+        { $_ -in 'mode', 'keep', 'check', 'watch', 'dupdir' } {
             if (-not $Value) { throw "사용법: $Command <값>" }
             $c = Set-Setting $Command $Value
             switch ($Command) {
                 'mode'   { "처리 방식을 설정했습니다: $(Get-ModeText $c.Mode)" }
                 'keep'   { "보관 기준을 설정했습니다: $(Get-KeepText $c.Keep)" }
+                'check'  { "내용 비교를 설정했습니다: $(Get-CheckText $c.ContentCheck)" }
                 'watch'  { "감시 폴더를 설정했습니다: $($c.WatchFolder)" }
                 'dupdir' { "중복 폴더를 설정했습니다: $($c.DuplicateFolder)" }
             }
