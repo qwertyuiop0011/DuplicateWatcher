@@ -1,0 +1,416 @@
+DupWatch.ps1 - change guide: "content comparison" option (내용 비교)
+=======================================================================
+
+WHAT THIS ADDS
+  A new on/off setting, "내용 비교" (content comparison), that controls the
+  file-hash check:
+
+    on  (default)  Same name but different contents  -> the new file is RETAINED
+                   (left where it is, untouched). Only files whose contents are
+                   identical get moved/deleted.
+    off            Same name is enough -> the new file is moved/deleted
+                   WHATEVER its contents. In delete mode it is deleted for good.
+
+  Controls:
+    Command line:  .\DupWatch.ps1 check on
+                   .\DupWatch.ps1 check off
+    Menu (TUI):    new item 4 "내용 비교 끄기 / 켜기". The items after it move down
+                   by one, and "종료" (quit) is now item 0.
+
+  Behavior change vs. the previous version:
+    Before, a same-name file with DIFFERENT contents was always moved to the
+    duplicate folder (even in delete mode). With content comparison ON it now
+    stays in place instead. With it OFF, it is moved (move mode) or deleted
+    (delete mode).
+
+HOW TO USE THIS GUIDE
+  Apply the 19 steps below to your current DupWatch.ps1, top to bottom.
+  For each step:
+    1. Search for the text between "----- FIND -----" and "----- REPLACE WITH -----".
+       Copy it exactly, including the spaces at the start of each line.
+    2. Replace it with the text between "----- REPLACE WITH -----" and "----- END -----".
+  Every FIND text appears exactly once in the file.
+  The marker lines themselves ("----- FIND -----" etc.) are NOT part of the code.
+
+  IMPORTANT: save the file as "UTF-8 with BOM" when you're done (VS Code: bottom
+  right "UTF-8" -> "Save with Encoding" -> "UTF-8 with BOM"). Otherwise Windows
+  PowerShell 5.1 shows the Korean text as garbage.
+
+  Or simply use the attached new DupWatch.ps1, which already has every change.
+
+
+=======================================================================
+STEP 1 / 19  - Help text at the top: add the "check" command
+=======================================================================
+----- FIND -----
+        .\DupWatch.ps1 keep oldest|newest      가장 오래된 파일 유지 / 가장 최근 파일 유지
+----- REPLACE WITH -----
+        .\DupWatch.ps1 keep oldest|newest      가장 오래된 파일 유지 / 가장 최근 파일 유지
+        .\DupWatch.ps1 check on|off            내용 비교 켜기 / 끄기
+----- END -----
+
+
+=======================================================================
+STEP 2 / 19  - Help text at the top: explain the new option
+=======================================================================
+----- FIND -----
+        newest  기존 "사진.png" 를 처리하고, 새로 받은 파일의 이름을 "사진.png" 로 바꿔 남깁니다.
+
+----- REPLACE WITH -----
+        newest  기존 "사진.png" 를 처리하고, 새로 받은 파일의 이름을 "사진.png" 로 바꿔 남깁니다.
+
+    내용 비교 (check):
+        on   이름이 같아도 내용(파일 해시)이 다르면 새 파일을 그대로 남깁니다.
+             내용까지 똑같은 파일만 이동/삭제합니다. (기본값)
+        off  이름만 같으면 내용과 상관없이 무조건 이동/삭제합니다.
+             삭제 모드에서는 내용이 다른 파일도 영구 삭제되므로 주의하세요.
+
+----- END -----
+
+
+=======================================================================
+STEP 3 / 19  - param(): allow the new "check" command
+=======================================================================
+----- FIND -----
+    [ValidateSet('menu', 'start', 'stop', 'status', 'mode', 'keep', 'dupdir', 'watch', 'autostart', 'log', 'run')]
+----- REPLACE WITH -----
+    [ValidateSet('menu', 'start', 'stop', 'status', 'mode', 'keep', 'check', 'dupdir', 'watch', 'autostart', 'log', 'run')]
+----- END -----
+
+
+=======================================================================
+STEP 4 / 19  - Read-Config: new setting "ContentCheck" (default On), load and validate it
+=======================================================================
+----- FIND -----
+        Keep            = 'Oldest'    # Oldest = 오래된 파일 유지, Newest = 최근 파일 유지
+    }
+    if (Test-Path -LiteralPath $script:ConfigPath) {
+        try {
+            $saved = Get-Content -LiteralPath $script:ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($k in 'WatchFolder', 'DuplicateFolder', 'Mode', 'Keep') { if ($saved.$k) { $cfg.$k = $saved.$k } }
+        } catch {}
+    }
+    # 잘못된 값이 들어 있으면 기본값으로 되돌림
+    if ($cfg.Mode -eq 'Delete') { $cfg.Mode = 'Delete' } else { $cfg.Mode = 'Move' }
+    if ($cfg.Keep -eq 'Newest') { $cfg.Keep = 'Newest' } else { $cfg.Keep = 'Oldest' }
+----- REPLACE WITH -----
+        Keep            = 'Oldest'    # Oldest = 오래된 파일 유지, Newest = 최근 파일 유지
+        ContentCheck    = 'On'        # On = 내용이 다르면 새 파일 유지, Off = 이름만 같으면 무조건 처리
+    }
+    if (Test-Path -LiteralPath $script:ConfigPath) {
+        try {
+            $saved = Get-Content -LiteralPath $script:ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($k in 'WatchFolder', 'DuplicateFolder', 'Mode', 'Keep', 'ContentCheck') { if ($saved.$k) { $cfg.$k = $saved.$k } }
+        } catch {}
+    }
+    # 잘못된 값이 들어 있으면 기본값으로 되돌림
+    if ($cfg.Mode -eq 'Delete') { $cfg.Mode = 'Delete' } else { $cfg.Mode = 'Move' }
+    if ($cfg.Keep -eq 'Newest') { $cfg.Keep = 'Newest' } else { $cfg.Keep = 'Oldest' }
+    if ($cfg.ContentCheck -eq 'Off') { $cfg.ContentCheck = 'Off' } else { $cfg.ContentCheck = 'On' }
+----- END -----
+
+
+=======================================================================
+STEP 5 / 19  - Remove-DuplicateFile: remove the hash check from here
+               (it moves to Invoke-DuplicateAction in step 6). The function
+               now takes 2 parameters instead of 3.
+=======================================================================
+----- FIND -----
+# $Target 파일을 없앰: 삭제 모드이고 $Kept 와 내용이 똑같으면 삭제, 그 밖에는 중복 폴더로 이동.
+# 성공하면 $true.
+function Remove-DuplicateFile([System.IO.FileInfo]$Target, [System.IO.FileInfo]$Kept, $Cfg) {
+    if ($Cfg.Mode -eq 'Delete') {
+        if (Test-SameContent $Target $Kept) {
+            try {
+                [System.IO.File]::Delete($Target.FullName)
+                Write-DupLog "중복 파일 삭제: $($Target.Name)"
+                return $true
+            } catch {
+                Write-DupLog "삭제 실패 $($Target.Name): $($_.Exception.Message)"
+                return $false
+            }
+        }
+        # 이름만 같고 내용이 다르면 절대 지우지 않고 이동시킴
+        Write-DupLog "내용이 $($Kept.Name) 와(과) 달라 삭제 대신 이동: $($Target.Name)"
+    }
+----- REPLACE WITH -----
+# $Target 파일을 없앰: 삭제 모드면 삭제, 이동 모드면 중복 폴더로 이동. 성공하면 $true.
+# (내용 비교는 이 함수를 부르기 전에 Invoke-DuplicateAction 에서 끝냄)
+function Remove-DuplicateFile([System.IO.FileInfo]$Target, $Cfg) {
+    if ($Cfg.Mode -eq 'Delete') {
+        try {
+            [System.IO.File]::Delete($Target.FullName)
+            Write-DupLog "중복 파일 삭제: $($Target.Name)"
+            return $true
+        } catch {
+            Write-DupLog "삭제 실패 $($Target.Name): $($_.Exception.Message)"
+            return $false
+        }
+    }
+----- END -----
+
+
+=======================================================================
+STEP 6 / 19  - Invoke-DuplicateAction: THE CORE CHANGE.
+               With content comparison on, a same-name file with different
+               contents is retained. Also updates the call to the
+               2-parameter Remove-DuplicateFile (keep-newest branch).
+=======================================================================
+----- FIND -----
+    $origFile = Get-Item -LiteralPath $orig
+
+    if ($Cfg.Keep -eq 'Newest') {
+        # 최근 파일 유지: 기존 파일을 처리하고, 새 파일에 원래 이름을 붙임
+        if (-not (Remove-DuplicateFile $origFile $File $Cfg)) { return $false }
+----- REPLACE WITH -----
+    $origFile = Get-Item -LiteralPath $orig
+
+    # 내용 비교가 켜져 있으면: 이름만 같고 내용(해시)이 다른 파일은 진짜 중복이 아니므로 그대로 남김
+    if ($Cfg.ContentCheck -eq 'On' -and -not (Test-SameContent $File $origFile)) {
+        Write-DupLog "이름은 같지만 내용이 달라 새 파일 유지: $($File.Name)"
+        return $false
+    }
+
+    if ($Cfg.Keep -eq 'Newest') {
+        # 최근 파일 유지: 기존 파일을 처리하고, 새 파일에 원래 이름을 붙임
+        if (-not (Remove-DuplicateFile $origFile $Cfg)) { return $false }
+----- END -----
+
+
+=======================================================================
+STEP 7 / 19  - Invoke-DuplicateAction: update the second call (keep-oldest branch)
+=======================================================================
+----- FIND -----
+    Remove-DuplicateFile $File $origFile $Cfg
+----- REPLACE WITH -----
+    Remove-DuplicateFile $File $Cfg
+----- END -----
+
+
+=======================================================================
+STEP 8 / 19  - Invoke-WatcherLoop: show the new setting in the "started" log line
+=======================================================================
+----- FIND -----
+        Write-DupLog "시작됨, 감시 폴더: $($state.Watching) (처리 방식: $(Get-ModeText $c.Mode), 보관 기준: $(Get-KeepText $c.Keep))"
+----- REPLACE WITH -----
+        Write-DupLog "시작됨, 감시 폴더: $($state.Watching) (처리 방식: $(Get-ModeText $c.Mode), 보관 기준: $(Get-KeepText $c.Keep), 내용 비교: $(Get-CheckText $c.ContentCheck))"
+----- END -----
+
+
+=======================================================================
+STEP 9 / 19  - New helper Get-CheckText (setting value -> Korean text)
+=======================================================================
+----- FIND -----
+function Get-KeepText([string]$Keep) { if ($Keep -eq 'Newest') { '최근 파일 유지' } else { '오래된 파일 유지' } }
+----- REPLACE WITH -----
+function Get-KeepText([string]$Keep) { if ($Keep -eq 'Newest') { '최근 파일 유지' } else { '오래된 파일 유지' } }
+function Get-CheckText([string]$Check) { if ($Check -eq 'Off') { '꺼짐' } else { '켜짐' } }
+----- END -----
+
+
+=======================================================================
+STEP 10 / 19  - Set-Setting: accept "check on|off"
+=======================================================================
+----- FIND -----
+            if ($NewValue -eq 'newest') { $cfg.Keep = 'Newest' } else { $cfg.Keep = 'Oldest' }
+        }
+----- REPLACE WITH -----
+            if ($NewValue -eq 'newest') { $cfg.Keep = 'Newest' } else { $cfg.Keep = 'Oldest' }
+        }
+        'check' {
+            if ($NewValue -notin 'on', 'off') { throw "내용 비교는 'on'(켜기) 또는 'off'(끄기)만 가능합니다." }
+            if ($NewValue -eq 'off') { $cfg.ContentCheck = 'Off' } else { $cfg.ContentCheck = 'On' }
+        }
+----- END -----
+
+
+=======================================================================
+STEP 11 / 19  - Get-Status: include the new setting
+=======================================================================
+----- FIND -----
+        Keep            = $cfg.Keep
+        WatchFolder     = $cfg.WatchFolder
+----- REPLACE WITH -----
+        Keep            = $cfg.Keep
+        ContentCheck    = $cfg.ContentCheck
+        WatchFolder     = $cfg.WatchFolder
+----- END -----
+
+
+=======================================================================
+STEP 12 / 19  - TUI, Get-MenuItems: add the new menu item (becomes item 4)
+=======================================================================
+----- FIND -----
+        $(if ($St.Keep -eq 'Newest') { '오래된 파일 유지로 전환' } else { '최근 파일 유지로 전환' }),
+        '감시 폴더 변경',
+----- REPLACE WITH -----
+        $(if ($St.Keep -eq 'Newest') { '오래된 파일 유지로 전환' } else { '최근 파일 유지로 전환' }),
+        $(if ($St.ContentCheck -eq 'Off') { '내용 비교 켜기' } else { '내용 비교 끄기' }),
+        '감시 폴더 변경',
+----- END -----
+
+
+=======================================================================
+STEP 13 / 19  - TUI, Show-Screen: fix the delete-mode description
+               (it is no longer "only identical files" when the check is off)
+=======================================================================
+----- FIND -----
+    if ($St.Mode -eq 'Delete') { $modeText = '삭제 (내용이 똑같은 중복 파일만 삭제)' } else { $modeText = '이동 (중복 파일을 중복 폴더로 이동)' }
+----- REPLACE WITH -----
+    if ($St.Mode -eq 'Delete') { $modeText = '삭제 (중복 파일을 영구 삭제)' } else { $modeText = '이동 (중복 파일을 중복 폴더로 이동)' }
+----- END -----
+
+
+=======================================================================
+STEP 14 / 19  - TUI, Show-Screen: new status row "내용 비교" (yellow when off)
+=======================================================================
+----- FIND -----
+    Write-Row $W @(@((Format-Fit '보관 기준' $label), 'DarkGray'), @($keepText, 'White'))
+----- REPLACE WITH -----
+    Write-Row $W @(@((Format-Fit '보관 기준' $label), 'DarkGray'), @($keepText, 'White'))
+    if ($St.ContentCheck -eq 'Off') { $checkText = '꺼짐 (이름만 같으면 무조건 처리)'; $checkColor = 'Yellow' }
+    else { $checkText = '켜짐 (내용이 다르면 새 파일 유지)'; $checkColor = 'White' }
+    Write-Row $W @(@((Format-Fit '내용 비교' $label), 'DarkGray'), @($checkText, $checkColor))
+----- END -----
+
+
+=======================================================================
+STEP 15 / 19  - TUI, Show-Screen: the 10th menu item is shown as "0"
+=======================================================================
+----- FIND -----
+        $text = Format-Fit (" {0}  {1}" -f ($i + 1), $items[$i]) $inner
+----- REPLACE WITH -----
+        $text = Format-Fit (" {0}  {1}" -f (($i + 1) % 10), $items[$i]) $inner   # 10번째 항목은 0 키
+----- END -----
+
+
+=======================================================================
+STEP 16 / 19  - TUI, Show-Screen: key hint at the bottom
+=======================================================================
+----- FIND -----
+    Write-Seg (Format-Fit ' 방향키 이동   Enter 선택   1-9 바로가기   Q 종료' $W) 'DarkGray'
+----- REPLACE WITH -----
+    Write-Seg (Format-Fit ' 방향키 이동   Enter 선택   1-9,0 바로가기   Q 종료' $W) 'DarkGray'
+----- END -----
+
+
+=======================================================================
+STEP 17 / 19  - TUI, Invoke-MenuAction: delete-mode message + new action 3,
+                and renumber the actions after it (3->4, 4->5, 5->6, 6->7, 7->8)
+=======================================================================
+----- FIND -----
+            else { [void](Set-Setting 'mode' 'delete'); '처리 방식: 똑같은 중복 파일은 삭제합니다. (내용이 다르면 이동)' }
+        }
+        2 {
+            if ($St.Keep -eq 'Newest') { [void](Set-Setting 'keep' 'oldest'); '보관 기준: 기존(오래된) 파일을 남깁니다.' }
+            else { [void](Set-Setting 'keep' 'newest'); '보관 기준: 새로 받은(최근) 파일을 원래 이름으로 남깁니다.' }
+        }
+        3 {
+            $a = Read-FolderInput '감시 폴더' $St.WatchFolder
+            if ("$a".Trim()) { $c = Set-Setting 'watch' $a; "감시 폴더: $($c.WatchFolder)" } else { '취소했습니다.' }
+        }
+        4 {
+            $a = Read-FolderInput '중복 폴더' $St.DuplicateFolder
+            if ("$a".Trim()) { $c = Set-Setting 'dupdir' $a; "중복 폴더: $($c.DuplicateFolder)" } else { '취소했습니다.' }
+        }
+        5 { Set-Autostart ($St.Autostart -ne 'on') }
+        6 { Show-FullLog; '' }
+        7 {
+----- REPLACE WITH -----
+            elseif ($St.ContentCheck -eq 'Off') { [void](Set-Setting 'mode' 'delete'); '처리 방식: 삭제. 주의! 내용 비교가 꺼져 있어 내용이 달라도 삭제됩니다.' }
+            else { [void](Set-Setting 'mode' 'delete'); '처리 방식: 내용이 똑같은 중복 파일을 삭제합니다.' }
+        }
+        2 {
+            if ($St.Keep -eq 'Newest') { [void](Set-Setting 'keep' 'oldest'); '보관 기준: 기존(오래된) 파일을 남깁니다.' }
+            else { [void](Set-Setting 'keep' 'newest'); '보관 기준: 새로 받은(최근) 파일을 원래 이름으로 남깁니다.' }
+        }
+        3 {
+            if ($St.ContentCheck -eq 'Off') {
+                [void](Set-Setting 'check' 'on'); '내용 비교 켜짐: 이름이 같아도 내용이 다르면 새 파일을 남깁니다.'
+            } else {
+                [void](Set-Setting 'check' 'off')
+                if ($St.Mode -eq 'Delete') { '내용 비교 꺼짐: 주의! 이름만 같으면 내용이 달라도 삭제됩니다.' }
+                else { '내용 비교 꺼짐: 이름만 같으면 내용과 상관없이 이동합니다.' }
+            }
+        }
+        4 {
+            $a = Read-FolderInput '감시 폴더' $St.WatchFolder
+            if ("$a".Trim()) { $c = Set-Setting 'watch' $a; "감시 폴더: $($c.WatchFolder)" } else { '취소했습니다.' }
+        }
+        5 {
+            $a = Read-FolderInput '중복 폴더' $St.DuplicateFolder
+            if ("$a".Trim()) { $c = Set-Setting 'dupdir' $a; "중복 폴더: $($c.DuplicateFolder)" } else { '취소했습니다.' }
+        }
+        6 { Set-Autostart ($St.Autostart -ne 'on') }
+        7 { Show-FullLog; '' }
+        8 {
+----- END -----
+
+
+=======================================================================
+STEP 18 / 19  - TUI, Show-Menu: 10 menu items now; the 0 key selects item 10 (quit)
+                (two separate edits in the same function: 18a and 18b)
+=======================================================================
+[18a]
+----- FIND -----
+    $count = 9
+----- REPLACE WITH -----
+    $count = 10
+----- END -----
+
+[18b]
+----- FIND -----
+                    if ([int]::TryParse([string]$key.KeyChar, [ref]$n) -and $n -ge 1 -and $n -le $count) {
+                        $sel = $n - 1
+                        $run = $sel
+                    }
+----- REPLACE WITH -----
+                    if ([int]::TryParse([string]$key.KeyChar, [ref]$n)) {
+                        if ($n -eq 0) { $n = 10 }   # 0 키 = 10번 항목 (종료)
+                        if ($n -ge 1 -and $n -le $count) {
+                            $sel = $n - 1
+                            $run = $sel
+                        }
+                    }
+----- END -----
+
+
+=======================================================================
+STEP 19 / 19  - Entry point (bottom of the file): "status" output and the "check" command
+                (three separate edits: 19a, 19b, 19c)
+=======================================================================
+[19a] status output - new line
+----- FIND -----
+            "보관 기준:  $(Get-KeepText $s.Keep)"
+----- REPLACE WITH -----
+            "보관 기준:  $(Get-KeepText $s.Keep)"
+            "내용 비교:  $(Get-CheckText $s.ContentCheck)"
+----- END -----
+
+[19b] route the "check" command to Set-Setting
+----- FIND -----
+        { $_ -in 'mode', 'keep', 'watch', 'dupdir' } {
+----- REPLACE WITH -----
+        { $_ -in 'mode', 'keep', 'check', 'watch', 'dupdir' } {
+----- END -----
+
+[19c] confirmation message for "check"
+----- FIND -----
+                'keep'   { "보관 기준을 설정했습니다: $(Get-KeepText $c.Keep)" }
+----- REPLACE WITH -----
+                'keep'   { "보관 기준을 설정했습니다: $(Get-KeepText $c.Keep)" }
+                'check'  { "내용 비교를 설정했습니다: $(Get-CheckText $c.ContentCheck)" }
+----- END -----
+
+
+=======================================================================
+CHECK AFTER EDITING
+=======================================================================
+  .\DupWatch.ps1 check off      -> 내용 비교를 설정했습니다: 꺼짐
+  .\DupWatch.ps1 status         -> a "내용 비교:" line is shown
+  .\DupWatch.ps1                -> the menu shows a "내용 비교" row and item "4 내용 비교 켜기"
+
+  If DupWatch was already running, it picks up the new setting automatically
+  within about 2 seconds. To load the new CODE, though, restart it once:
+    .\DupWatch.ps1 stop
+    .\DupWatch.ps1 start
